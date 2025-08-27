@@ -33,7 +33,7 @@ class MovingDroneAviary(BaseRLAviary):
     def __init__(
         self,
         task,
-        drone_model : DroneModel   = DroneModel.CF2X,
+        drone_model : DroneModel   = DroneModel.SWARM_DRONE,
         physics     : Physics      = Physics.PYB,
         pyb_freq    : int          = 240,
         ctrl_freq   : int          = 30,

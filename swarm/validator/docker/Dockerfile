@@ -26,7 +26,7 @@ COPY swarm/validator/docker/docker-requirements.txt /tmp/docker-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/docker-requirements.txt
 
 # Install gym-pybullet-drones (with numpy 1.x) then upgrade to numpy 2.x
-RUN pip install --no-cache-dir git+https://github.com/utiasDSL/gym-pybullet-drones.git
+RUN pip install --no-cache-dir git+https://github.com/swarm-subnet/swarm-gym-pybullet-drones.git
 RUN pip install --no-cache-dir --upgrade "numpy>=2.0.0"
 
 WORKDIR /app
