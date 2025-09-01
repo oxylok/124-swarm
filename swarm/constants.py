@@ -85,4 +85,13 @@ UID_ZERO = 0                            # Special UID for burning emissions
 # Reward distribution mechanism
 WINNER_TAKE_ALL = True                  # Enable winner-take-all rewards (winner gets all available emissions)
 
+# =============================================================================
+# MULTI-OBJECTIVE CHALLENGE SETTINGS
+# =============================================================================
+
+MULTI_GOAL_MODE = False                 # Enable multi-waypoint challenges
+RANDOM_GOAL_COUNT = False               # Randomize waypoint count per episode
+MAX_WAYPOINTS = 6                       # Maximum number of waypoints
+MIN_WAYPOINTS = 2                       # Minimum waypoints when randomized
+
 

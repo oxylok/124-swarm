@@ -24,7 +24,8 @@ if swarm_path not in sys.path:
     sys.path.insert(0, swarm_path)
 
 from dataclasses import asdict
-from swarm.protocol import MapTask, ValidationResult
+from swarm.protocol import MapTask
+from swarm.validator.reward import flight_reward, multi_waypoint_reward
 from swarm.core.secure_loader import secure_load_ppo
 from swarm.constants import SPEED_LIMIT
 from gym_pybullet_drones.utils.enums import ActionType
@@ -320,14 +321,36 @@ def main():
                         break
                     step_count += 1
 
-                # Compute score using reward function
-                from swarm.validator.reward import flight_reward
-                score = flight_reward(
-                    success=success,
-                    t=t_sim,
-                    horizon=task.horizon,
-                    task=task,
-                )
+                # Compute score using appropriate reward function
+                if hasattr(task, 'goals') and task.goals and len(task.goals) > 1:
+                    # Multi-waypoint mode: get waypoint progress from environment
+                    
+                    # Get waypoint information from environment info
+                    try:
+                        env_info = env._computeInfo()
+                        waypoints_reached = env_info.get('waypoints_reached', 0)
+                        waypoint_times = env_info.get('waypoint_times', [])
+                    except:
+                        # Fallback: estimate from environment state
+                        waypoints_reached = len(env.waypoint_reached_times) if hasattr(env, 'waypoint_reached_times') else 0
+                        waypoint_times = env.waypoint_reached_times.copy() if hasattr(env, 'waypoint_reached_times') else []
+                    
+                    score = multi_waypoint_reward(
+                        waypoints_reached=waypoints_reached,
+                        total_waypoints=len(task.goals),
+                        time_taken=waypoint_times,
+                        current_time=t_sim,
+                        horizon=task.horizon,
+                        task=task,
+                    )
+                else:
+                    # Single waypoint mode (existing behavior)
+                    score = flight_reward(
+                        success=success,
+                        t=t_sim,
+                        horizon=task.horizon,
+                        task=task,
+                    )
 
                 result = ValidationResult(uid, success, t_sim, score)
             finally:

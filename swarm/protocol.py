@@ -32,7 +32,20 @@ class MapTask:
     goal: Tuple[float, float, float]
     sim_dt: float
     horizon: float
+    goals: Optional[List[Tuple[float, float, float]]] = None
     version: str = "1"
+
+    @property
+    def is_multi_goal(self) -> bool:
+        """Check if this task has multiple waypoints."""
+        return self.goals is not None and len(self.goals) > 1
+    
+    @property
+    def all_goals(self) -> List[Tuple[float, float, float]]:
+        """Get all goals, handling both single and multi modes."""
+        if self.goals:
+            return self.goals
+        return [self.goal]
 
     def pack(self) -> bytes:
         return msgpack.packb(asdict(self), use_bin_type=True)

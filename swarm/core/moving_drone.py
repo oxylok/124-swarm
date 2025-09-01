@@ -13,8 +13,8 @@ from gym_pybullet_drones.utils.enums import (
 )
 
 # ── project‑level utilities ────────────────────────────────────────────────
-from swarm.validator.reward import flight_reward          # 3‑term scorer
-from swarm.constants        import GOAL_TOL, HOVER_SEC, DRONE_HULL_RADIUS, MAX_RAY_DISTANCE
+from swarm.validator.reward import flight_reward, multi_waypoint_reward
+from swarm.constants        import GOAL_TOL, HOVER_SEC, DRONE_HULL_RADIUS, MAX_RAY_DISTANCE, MULTI_GOAL_MODE
 
 
 class MovingDroneAviary(BaseRLAviary):
@@ -53,6 +53,16 @@ class MovingDroneAviary(BaseRLAviary):
         self.GOAL_POS   = np.asarray(task.goal, dtype=float)
         self.EP_LEN_SEC = float(task.horizon)
 
+        # multi‑waypoint support
+        if MULTI_GOAL_MODE and task.is_multi_goal:
+            self.waypoints = [np.asarray(wp, dtype=float) for wp in task.goals]
+        else:
+            self.waypoints = [self.GOAL_POS]
+        
+        self.current_waypoint_idx = 0
+        self.waypoint_reached_times = []
+        self.waypoint_hover_times = [0.0] * len(self.waypoints)
+
         # internal book‑keeping
         self._time_alive   = 0.0
         self._hover_sec    = 0.0
@@ -79,7 +89,7 @@ class MovingDroneAviary(BaseRLAviary):
             act          = act,
         )
 
-        # ‑‑‑ extend observation with obstacle distances (16-D) + goal vector (3-D) ‑‑‑
+        # ‑‑‑ extend observation with obstacle distances (16-D) + waypoint vectors ‑‑‑
         obs_space = cast(spaces.Box, self.observation_space)
         old_low,  old_high  = obs_space.low, obs_space.high
 
@@ -87,15 +97,30 @@ class MovingDroneAviary(BaseRLAviary):
         dist_low = np.zeros((old_low.shape[0], 16), dtype=np.float32)
         dist_high = np.ones((old_high.shape[0], 16), dtype=np.float32)  # scaled to [0.0, 1.0]
 
-        # Goal vector: 3 dimensions, unlimited range
-        goal_low = -np.ones((old_low.shape[0], 3), dtype=np.float32) * np.inf
-        goal_high = +np.ones((old_high.shape[0], 3), dtype=np.float32) * np.inf
-
-        self.observation_space = spaces.Box(
-            low   = np.concatenate([old_low, dist_low, goal_low], axis=1),
-            high  = np.concatenate([old_high, dist_high, goal_high], axis=1),
-            dtype = np.float32,
-        )
+        # Goal and waypoint vectors based on mode
+        if MULTI_GOAL_MODE and len(self.waypoints) > 1:
+            # Multi-goal: current goal (3D) + next waypoint (3D) = 6D
+            goal_low = -np.ones((old_low.shape[0], 3), dtype=np.float32) * np.inf
+            goal_high = +np.ones((old_high.shape[0], 3), dtype=np.float32) * np.inf
+            
+            next_low = -np.ones((old_low.shape[0], 3), dtype=np.float32) * np.inf
+            next_high = +np.ones((old_high.shape[0], 3), dtype=np.float32) * np.inf
+            
+            self.observation_space = spaces.Box(
+                low   = np.concatenate([old_low, dist_low, goal_low, next_low], axis=1),
+                high  = np.concatenate([old_high, dist_high, goal_high, next_high], axis=1),
+                dtype = np.float32,
+            )
+        else:
+            # Single-goal: just goal vector (3D)
+            goal_low = -np.ones((old_low.shape[0], 3), dtype=np.float32) * np.inf
+            goal_high = +np.ones((old_high.shape[0], 3), dtype=np.float32) * np.inf
+            
+            self.observation_space = spaces.Box(
+                low   = np.concatenate([old_low, dist_low, goal_low], axis=1),
+                high  = np.concatenate([old_high, dist_high, goal_high], axis=1),
+                dtype = np.float32,
+            )
 
     # --------------------------------------------------------------------- #
     # 2. low‑level helpers
@@ -234,8 +259,8 @@ class MovingDroneAviary(BaseRLAviary):
         if not contact_points:
             return False
         
-        # Get the landing surface body ID from the environment
-        landing_surface_uid = getattr(self, '_landing_surface_uid', None)
+        # Get the landing surface body IDs from the environment (now supports multiple platforms)
+        landing_surface_uids = getattr(self, '_landing_surface_uids', [])
         
         # Check each contact point
         for contact in contact_points:
@@ -245,14 +270,47 @@ class MovingDroneAviary(BaseRLAviary):
                 normal_force = contact[9]
                 if normal_force > 0.01:  # Minimum threshold to avoid numerical noise
                     
-                    # CRITICAL FIX: Only allow contacts with the flat landing surface
-                    if landing_surface_uid is not None and body_b == landing_surface_uid:
+                    # CRITICAL FIX: Only allow contacts with the flat landing surfaces
+                    if landing_surface_uids and body_b in landing_surface_uids:
                         continue  # This contact is allowed (landing on TAO badge surface)
                     
                     # All other contacts are collisions (platform side, obstacles, etc.)
                     return True
         
         return False
+
+    def _update_waypoint_progress(self, drone_state: np.ndarray):
+        if not (MULTI_GOAL_MODE and len(self.waypoints) > 1):
+            return
+        
+        current_wp = self.waypoints[self.current_waypoint_idx]
+        horizontal_distance = float(np.linalg.norm(drone_state[0:2] - current_wp[0:2]))
+        vertical_distance = abs(drone_state[2] - current_wp[2])
+        
+        is_final_waypoint = (self.current_waypoint_idx == len(self.waypoints) - 1)
+        hover_threshold = 3.0 if is_final_waypoint else 1.0  # 1s for intermediate, 3s for final
+        
+        # Check if reached current waypoint
+        reached = (horizontal_distance < GOAL_TOL and
+                  vertical_distance < 0.3 and
+                  drone_state[2] >= current_wp[2] - 0.1)
+        
+        if reached:
+            self.waypoint_hover_times[self.current_waypoint_idx] += self._sim_dt
+            if self.waypoint_hover_times[self.current_waypoint_idx] >= hover_threshold:
+                
+                # Record time when waypoint was reached
+                self.waypoint_reached_times.append(self._time_alive)
+                
+                if is_final_waypoint:
+                    self._success = True
+                    self._t_to_goal = self._time_alive
+                else:
+                    # Advance to next waypoint
+                    self.current_waypoint_idx += 1
+                    self.GOAL_POS = np.asarray(self.waypoints[self.current_waypoint_idx], dtype=float)
+        else:
+            self.waypoint_hover_times[self.current_waypoint_idx] = 0.0
 
     # --------------------------------------------------------------------- #
     # 3. OpenAI‑Gym API overrides
@@ -269,6 +327,11 @@ class MovingDroneAviary(BaseRLAviary):
         self._success    = False
         self._collision  = False
         self._t_to_goal  = None
+        
+        # Reset waypoint tracking
+        self.current_waypoint_idx = 0
+        self.waypoint_reached_times = []
+        self.waypoint_hover_times = [0.0] * len(self.waypoints)
 
         # baseline score (t = 0, e = 0)
         self._prev_score = flight_reward(
@@ -285,40 +348,50 @@ class MovingDroneAviary(BaseRLAviary):
         """
         **Incremental** reward based on the three‑term `flight_reward`.
         """
-        # current distance to goal
         state = self._getDroneStateVector(0)
-        dist  = float(np.linalg.norm(state[0:3] - self.GOAL_POS))
-
-        # ── success detection: remain inside TAO badge with proper height constraints ──
-        # Use 2D horizontal distance + vertical constraints
-        horizontal_distance = float(np.linalg.norm(state[0:2] - self.GOAL_POS[0:2]))  # X,Y only
-        vertical_distance = abs(state[2] - self.GOAL_POS[2])                          # Z only
         
-        # Success requires: within TAO badge horizontally + proper height + above platform
-        reached = (horizontal_distance < GOAL_TOL and       # Within TAO badge radius
-                  vertical_distance < 0.3 and              # Within 30cm of surface  
-                  state[2] >= self.GOAL_POS[2] - 0.1)      # Above platform (not below)
-        if reached:
-            self._hover_sec += self._sim_dt
-            if self._hover_sec >= HOVER_SEC and not self._success:
-                self._success   = True
-                self._t_to_goal = self._time_alive
+        if MULTI_GOAL_MODE and len(self.waypoints) > 1:
+            # Multi-waypoint mode: use waypoint progression logic
+            self._update_waypoint_progress(state)
         else:
-            self._hover_sec = 0.0
+            # Single-goal mode: original logic
+            horizontal_distance = float(np.linalg.norm(state[0:2] - self.GOAL_POS[0:2]))
+            vertical_distance = abs(state[2] - self.GOAL_POS[2])
+            
+            reached = (horizontal_distance < GOAL_TOL and
+                      vertical_distance < 0.3 and
+                      state[2] >= self.GOAL_POS[2] - 0.1)
+            if reached:
+                self._hover_sec += self._sim_dt
+                if self._hover_sec >= HOVER_SEC and not self._success:
+                    self._success = True
+                    self._t_to_goal = self._time_alive
+            else:
+                self._hover_sec = 0.0
 
         # ── clock update ────────────────────────────────────────────────────
         self._time_alive += self._sim_dt
 
-        # ── call new reward function ───────────────────────────────────────
-        # If collision detected, force score to 0
+        # ── call reward function ───────────────────────────────────────────
         if self._collision:
             score = 0.0
+        elif MULTI_GOAL_MODE and len(self.waypoints) > 1:
+            # Multi-waypoint mode: calculate based on partial completion
+            score = multi_waypoint_reward(
+                waypoints_reached=len(self.waypoint_reached_times),
+                total_waypoints=len(self.waypoints),
+                time_taken=self.waypoint_reached_times.copy(),
+                current_time=self._time_alive,
+                horizon=self.EP_LEN_SEC,
+                task=self.task,
+            )
         else:
+            # Single-goal mode: use original flight_reward
             score = flight_reward(
-                success = self._success,
-                t       = (self._t_to_goal if self._success else self._time_alive),
-                horizon = self.EP_LEN_SEC,
-                task    = None,
+                success=self._success,
+                t=(self._t_to_goal if self._success else self._time_alive),
+                horizon=self.EP_LEN_SEC,
+                task=None,
             )
 
         r_t              = score - self._prev_score
@@ -356,13 +429,25 @@ class MovingDroneAviary(BaseRLAviary):
     def _computeInfo(self):
         state = self._getDroneStateVector(0)
         dist  = float(np.linalg.norm(state[0:3] - self.GOAL_POS))
-        return {
+        
+        info = {
             "distance_to_goal": dist,
             "score"           : self._prev_score,
             "success"         : self._success,
             "collision"       : self._collision,
             "t_to_goal"       : self._t_to_goal,
         }
+        
+        # Add waypoint information for multi-goal mode
+        if MULTI_GOAL_MODE and len(self.waypoints) > 1:
+            info.update({
+                "waypoints_reached": len(self.waypoint_reached_times),
+                "current_waypoint": self.current_waypoint_idx,
+                "total_waypoints": len(self.waypoints),
+                "waypoint_times": self.waypoint_reached_times.copy(),
+            })
+        
+        return info
 
     # -------- observation extension -------------------------------------- #
     def _computeObs(self) -> np.ndarray:
@@ -372,9 +457,12 @@ class MovingDroneAviary(BaseRLAviary):
         Distances are computed from the **current PyBullet pose** and
         then scaled to [0,1] by dividing by `max_ray_distance` (10 m).
         """
-        base_obs: NDArray[np.float32] | None = super()._computeObs()  # shape (1, 112) in your setup
+        base_obs: NDArray[np.float32] | None = super()._computeObs()  # shape (1, 112)
         if base_obs is None:
-            return np.zeros((1, 131), dtype=np.float32)
+            if MULTI_GOAL_MODE and len(self.waypoints) > 1:
+                return np.zeros((1, 134), dtype=np.float32)
+            else:
+                return np.zeros((1, 131), dtype=np.float32)
 
         # --- Get exact pose from PyBullet to stay in sync with physics ---
         uid = self.DRONE_IDS[0]
@@ -384,11 +472,22 @@ class MovingDroneAviary(BaseRLAviary):
 
         # --- Cast rays from that pose ---
         distances_m = self._get_obstacle_distances(pos_w, rot_m).reshape(1, 16)
-
-        # Scale to [0,1] for the observation
         distances_scaled = distances_m / self.max_ray_distance
 
-        # Goal vector relative to current position (scaled by ray distance)
-        rel = ((self.GOAL_POS - pos_w) / self.max_ray_distance).reshape(1, 3)
+        # Current goal vector (always present)
+        current_goal = self.waypoints[self.current_waypoint_idx]  
+        goal_rel = ((current_goal - pos_w) / self.max_ray_distance).reshape(1, 3)
 
-        return np.concatenate([base_obs, distances_scaled, rel], axis=1).astype(np.float32)
+        if MULTI_GOAL_MODE and len(self.waypoints) > 1:
+            # Multi-goal mode: add next waypoint vector (134D total)
+            if self.current_waypoint_idx < len(self.waypoints) - 1:
+                next_wp = self.waypoints[self.current_waypoint_idx + 1]
+                next_rel = ((next_wp - pos_w) / self.max_ray_distance).reshape(1, 3)
+            else:
+                # At final waypoint, no next waypoint
+                next_rel = np.zeros((1, 3), dtype=np.float32)
+            
+            return np.concatenate([base_obs, distances_scaled, goal_rel, next_rel], axis=1).astype(np.float32)
+        else:
+            # Single-goal mode: 131D observation
+            return np.concatenate([base_obs, distances_scaled, goal_rel], axis=1).astype(np.float32)

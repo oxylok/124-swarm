@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import random
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 
 import pybullet as p
 
@@ -69,6 +69,133 @@ def _get_tao_tex(cli: int) -> int:
         _TAO_TEX_ID[cli] = p.loadTexture(str(tex_path))
     return _TAO_TEX_ID[cli]
 
+def _create_waypoint_platform(cli, position, is_final, waypoint_idx, total_waypoints):
+    """Create landing platform for a waypoint."""
+    gx, gy, gz = position
+    
+    platform_radius = LANDING_PLATFORM_RADIUS
+    platform_height = 0.2
+    
+    if is_final:
+        platform_color = [0.15, 0.35, 0.8, 1.0]
+        surface_color = [0.3, 0.9, 0.4, 0.9]
+        beacon_color = [1.0, 0.2, 0.1, 0.9]
+        use_tao_texture = True
+    else:
+        progress = waypoint_idx / max(1, total_waypoints - 1)
+        platform_color = [0.8 - progress*0.2, 0.6 + progress*0.2, 0.1, 1.0]
+        surface_color = [1.0 - progress*0.2, 0.9 - progress*0.1, 0.3, 0.9]
+        beacon_color = [0.9, 0.5 + progress*0.3, 0.0, 0.9]
+        use_tao_texture = False
+    
+    platform_collision = p.createCollisionShape(
+        shapeType=p.GEOM_CYLINDER,
+        radius=platform_radius,
+        height=platform_height,
+        physicsClientId=cli,
+    )
+    
+    platform_visual = p.createVisualShape(
+        shapeType=p.GEOM_CYLINDER,
+        radius=platform_radius,
+        length=platform_height,
+        rgbaColor=platform_color,
+        physicsClientId=cli,
+    )
+    
+    platform_uid = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=platform_collision,
+        baseVisualShapeIndex=platform_visual,
+        basePosition=[gx, gy, gz - platform_height / 2],
+        physicsClientId=cli
+    )
+    
+    surface_radius = platform_radius * 0.8
+    flat_collision = p.createCollisionShape(
+        shapeType=p.GEOM_CYLINDER,
+        radius=surface_radius,
+        height=0.001,
+        physicsClientId=cli,
+    )
+    
+    flat_surface_uid = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=flat_collision,
+        baseVisualShapeIndex=-1,
+        basePosition=[gx, gy, gz + 0.002],
+        physicsClientId=cli
+    )
+    
+    p.changeDynamics(
+        bodyUniqueId=flat_surface_uid,
+        linkIndex=-1,
+        restitution=0.0,
+        lateralFriction=3.0,
+        spinningFriction=2.0,
+        rollingFriction=1.0,
+        physicsClientId=cli
+    )
+    
+    surface_visual = p.createVisualShape(
+        shapeType=p.GEOM_CYLINDER,
+        radius=surface_radius,
+        length=0.008,
+        rgbaColor=surface_color,
+        physicsClientId=cli,
+    )
+    
+    surface_uid = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=surface_visual,
+        basePosition=[gx, gy, gz + 0.005],
+        physicsClientId=cli,
+    )
+    
+    beacon_visual = p.createVisualShape(
+        shapeType=p.GEOM_CYLINDER,
+        radius=0.012,
+        length=0.3,
+        rgbaColor=beacon_color,
+        physicsClientId=cli,
+    )
+    
+    beacon_uid = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=beacon_visual,
+        basePosition=[gx, gy, gz + 0.15],
+        physicsClientId=cli,
+    )
+    
+    if use_tao_texture:
+        tao_visual = p.createVisualShape(
+            shapeType=p.GEOM_CYLINDER,
+            radius=surface_radius * 0.95,
+            length=0.005,
+            rgbaColor=[1.0, 1.0, 1.0, 1.0],
+            physicsClientId=cli,
+        )
+        
+        tao_uid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=tao_visual,
+            basePosition=[gx, gy, gz + 0.010],
+            physicsClientId=cli,
+        )
+        
+        p.changeVisualShape(
+            tao_uid,
+            -1,
+            textureUniqueId=_get_tao_tex(cli),
+            flags=p.VISUAL_SHAPE_DOUBLE_SIDED,
+            physicsClientId=cli,
+        )
+    
+    return flat_surface_uid
+
 # --------------------------------------------------------------------------
 # Main world builder
 # --------------------------------------------------------------------------
@@ -78,7 +205,8 @@ def build_world(
     *,
     start: Optional[Tuple[float, float, float]] = None,
     goal: Optional[Tuple[float, float, float]] = None,
-) -> Optional[int]:
+    goals: Optional[List[Tuple[float, float, float]]] = None,
+) -> Optional[Union[int, List[int]]]:
     """
     Create procedural obstacles (with safe‑zone constraints) and—if *goal*
     is provided—place a visual TAO badge at that position.
@@ -231,11 +359,25 @@ def build_world(
     # ------------------------------------------------------------------
     # Physical landing platform with visual goal marker
     # ------------------------------------------------------------------
-    if goal is not None:
-        gx, gy, gz = goal
-
-        # Platform mode: solid if PLATFORM else visual-only
-        if PLATFORM:
+    waypoints = goals if goals else ([goal] if goal else [])
+    
+    if not waypoints:
+        return None
+    
+    if len(waypoints) > 1 and PLATFORM:
+        landing_surface_uids = []
+        
+        for idx, wp in enumerate(waypoints):
+            is_final = (idx == len(waypoints) - 1)
+            flat_surface_uid = _create_waypoint_platform(
+                cli, wp, is_final, idx, len(waypoints)
+            )
+            landing_surface_uids.append(flat_surface_uid)
+        
+        return landing_surface_uids
+    
+    elif waypoints and PLATFORM:
+            gx, gy, gz = waypoints[0]
             # 1) Physical landing platform - SOLID AND PRECISE -----------
             platform_radius = LANDING_PLATFORM_RADIUS  # Consistent radius
             platform_height = 0.2         # Thicker for better physics stability

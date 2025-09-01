@@ -78,15 +78,28 @@ def make_env(
     with contextlib.redirect_stdout(io.StringIO()):
         env.reset(seed=task.map_seed)
 
-    landing_surface_uid = build_world(
-        seed=task.map_seed,
-        cli=cli,
-        start=task.start,
-        goal=task.goal,
-    )
-    
-    # Store landing surface body ID in environment for collision detection
-    env._landing_surface_uid = landing_surface_uid
+    if hasattr(task, 'goals') and task.goals:
+        landing_surface_uids = build_world(
+            seed=task.map_seed,
+            cli=cli,
+            start=task.start,
+            goal=task.goal,
+            goals=task.goals,
+        )
+        
+        if isinstance(landing_surface_uids, list):
+            env._landing_surface_uids = landing_surface_uids
+        else:
+            env._landing_surface_uids = [landing_surface_uids] if landing_surface_uids else []
+    else:
+        landing_surface_uid = build_world(
+            seed=task.map_seed,
+            cli=cli,
+            start=task.start,
+            goal=task.goal,
+        )
+        
+        env._landing_surface_uids = [landing_surface_uid] if landing_surface_uid else []
 
     # 4 ─ spawn drone at the requested start pose ----------------------------
     start_xyz  = np.asarray(task.start, dtype=float)
